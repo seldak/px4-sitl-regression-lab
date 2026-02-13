@@ -1,0 +1,33 @@
+name: low_battery_rtl
+description: Start mission then force battery to deplete quickly to validate low-battery behavior (RTL/land).
+px4:
+  tag: v1.16.1
+mission:
+  takeoff_alt_m: 10
+  cruise_speed_m_s: 5
+  relative_waypoints_m:
+    - [60, 0, 10]
+    - [60, 60, 10]
+    - [0, 60, 10]
+    - [0, 0, 10]
+events:
+  # Make the simulated battery drain quickly down to a low percentage.
+  # SIM_BAT_DRAIN is the drain interval in seconds; smaller means faster depletion.
+  - at_s: 15
+    type: set_param
+    name: COM_LOW_BAT_ACT
+    value: 3
+  - at_s: 15
+    type: set_param
+    name: SIM_BAT_DRAIN
+    value: 2
+  - at_s: 20
+    type: set_param
+    name: SIM_BAT_MIN_PCT
+    value: 5
+thresholds:
+  timeout_s: 220
+  max_horiz_error_m: 8.0
+  rms_horiz_error_m: 4.0
+  max_speed_m_s: 20.0
+  max_tilt_deg: 65.0

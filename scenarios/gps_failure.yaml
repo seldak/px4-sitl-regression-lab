@@ -1,0 +1,29 @@
+name: gps_failure_mid_mission
+description: Inject GPS failure mid-mission using MAVSDK Failure plugin, then recover GPS later.
+px4:
+  tag: v1.16.1
+mission:
+  takeoff_alt_m: 10
+  cruise_speed_m_s: 5
+  relative_waypoints_m:
+    - [80, 0, 10]
+    - [80, 80, 10]
+    - [0, 80, 10]
+    - [0, 0, 10]
+events:
+  - at_s: 20
+    type: inject_failure
+    unit: gps
+    failure: off
+    instance: 0
+  - at_s: 40
+    type: inject_failure
+    unit: gps
+    failure: ok
+    instance: 0
+thresholds:
+  timeout_s: 260
+  max_horiz_error_m: 15.0
+  rms_horiz_error_m: 8.0
+  max_speed_m_s: 22.0
+  max_tilt_deg: 70.0

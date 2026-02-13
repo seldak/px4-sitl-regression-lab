@@ -1,0 +1,19 @@
+name: baseline_square_rtl
+description: Takeoff -> fly a 40m square at 10m AGL -> RTL -> land.
+px4:
+  tag: v1.16.1
+mission:
+  takeoff_alt_m: 10
+  cruise_speed_m_s: 5
+  relative_waypoints_m:
+    - [40, 0, 10]
+    - [40, 40, 10]
+    - [0, 40, 10]
+    - [0, 0, 10]
+events: []
+thresholds:
+  timeout_s: 180
+  max_horiz_error_m: 6.0
+  rms_horiz_error_m: 3.0
+  max_speed_m_s: 18.0
+  max_tilt_deg: 60.0

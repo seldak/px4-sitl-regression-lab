@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist/
+build/
+.venv/
+.env
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Artifacts
+runs/
+artifacts/
+*.ulg
+*.log
+
+# PX4 checkout (fetched on demand)
+external/PX4-Autopilot/
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
