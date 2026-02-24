@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 from mavsdk import System
 from mavsdk.mission import MissionItem, MissionPlan
@@ -24,32 +23,46 @@ class FlightOutcome:
     executed_events: List[Dict[str, Any]]
 
 
+def _now() -> float:
+    return time.monotonic()
+
+
 async def connect(system_address: str = "udpin://0.0.0.0:14540", timeout_s: float = 30.0) -> System:
+    print(f"[mavsdk] connect({system_address})", flush=True)
     drone = System()
     await drone.connect(system_address=system_address)
 
-    t0 = time.monotonic()
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            return drone
-        if time.monotonic() - t0 > timeout_s:
-            raise TimeoutError(f"Timed out waiting for MAVSDK connection on {system_address}")
+    async def _wait_connected() -> System:
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                print("[mavsdk] connected", flush=True)
+                return drone
+        raise TimeoutError("Connection state stream ended unexpectedly")
 
-    raise TimeoutError("Connection state stream ended unexpectedly")
+    return await asyncio.wait_for(_wait_connected(), timeout=timeout_s)
 
 
 async def wait_for_global_position(drone: System, timeout_s: float = 60.0) -> None:
-    t0 = time.monotonic()
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            return
-        if time.monotonic() - t0 > timeout_s:
-            raise TimeoutError("Timed out waiting for global/home position estimate")
+    print("[mavsdk] wait_for_global_position...", flush=True)
+
+    async def _wait() -> None:
+        async for health in drone.telemetry.health():
+            if health.is_global_position_ok and health.is_home_position_ok:
+                print("[mavsdk] global+home position OK", flush=True)
+                return
+
+    await asyncio.wait_for(_wait(), timeout=timeout_s)
 
 
-async def set_param_best_effort(drone: System, name: str, value: Union[int, float, str]) -> None:
-    # MAVSDK is strongly typed; PX4 params are strongly typed too.
-    # We try the most likely setter first, but fall back if needed.
+async def _get_first_position(drone: System, timeout_s: float = 20.0):
+    async def _wait():
+        async for pos in drone.telemetry.position():
+            return pos
+
+    return await asyncio.wait_for(_wait(), timeout=timeout_s)
+
+
+async def set_param_best_effort(drone: System, name: str, value: Union[int, float, str, bool]) -> None:
     if isinstance(value, bool):
         await drone.param.set_param_int(name, int(value))
         return
@@ -116,7 +129,6 @@ def _map_failure_type(failure: str) -> FailureType:
 
 def _build_mission_items(home_lat: float, home_lon: float, mission: MissionConfig) -> List[MissionItem]:
     items: List[MissionItem] = []
-
     for (north_m, east_m, alt_m) in mission.relative_waypoints_m:
         lat, lon = add_ned_offset_to_gps(home_lat, home_lon, north_m, east_m)
         items.append(
@@ -137,24 +149,73 @@ def _build_mission_items(home_lat: float, home_lon: float, mission: MissionConfi
                 MissionItem.VehicleAction.NONE,
             )
         )
-
     return items
 
 
-async def _observe_is_in_air(drone: System, running_tasks: List[asyncio.Task]) -> None:
-    """Returns after the vehicle has flown and then landed."""
+async def _cancel_tasks_best_effort(tasks: List[asyncio.Task], timeout_s: float = 2.0) -> None:
+    """Cancel tasks and wait briefly; never block forever."""
+    for t in tasks:
+        t.cancel()
+
+    for t in tasks:
+        try:
+            await asyncio.wait_for(t, timeout=timeout_s)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
+
+
+async def _observe_end_condition(drone: System, running_tasks: List[asyncio.Task]) -> None:
+    """
+    Return when we've seen the vehicle in-air at least once AND then it lands,
+    OR when it disarms after being armed (robust fallback).
+
+    IMPORTANT: cancellation of background tasks must be best-effort only,
+    otherwise we can hang after landing.
+    """
     was_in_air = False
-    async for is_in_air in drone.telemetry.in_air():
-        if is_in_air:
-            was_in_air = True
-        if was_in_air and not is_in_air:
-            for t in running_tasks:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-            return
+    was_armed = False
+
+    in_air_stream = drone.telemetry.in_air()
+    armed_stream = drone.telemetry.armed()
+
+    async def _pump_in_air():
+        nonlocal was_in_air
+        async for v in in_air_stream:
+            if v:
+                was_in_air = True
+            if was_in_air and not v:
+                return "landed"
+
+    async def _pump_armed():
+        nonlocal was_armed
+        async for v in armed_stream:
+            if v:
+                was_armed = True
+            if was_armed and not v:
+                return "disarmed"
+
+    done, pending = await asyncio.wait(
+        {asyncio.create_task(_pump_in_air()), asyncio.create_task(_pump_armed())},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    # Stop whichever detector didn't win (best effort)
+    for t in pending:
+        t.cancel()
+    for t in pending:
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception:
+            pass
+
+    # Stop background tasks (best effort; do NOT hang here)
+    await _cancel_tasks_best_effort(running_tasks, timeout_s=2.0)
+
+    _ = list(done)[0].result()
 
 
 async def _execute_events(
@@ -166,31 +227,33 @@ async def _execute_events(
 ) -> None:
     events_sorted = sorted(events, key=lambda e: e.at_s)
     idx = 0
+    try:
+        while idx < len(events_sorted):
+            await asyncio.sleep(0.1)
+            elapsed = _now() - t0_monotonic
+            if elapsed < events_sorted[idx].at_s:
+                continue
 
-    while idx < len(events_sorted):
-        await asyncio.sleep(0.1)
-        elapsed = time.monotonic() - t0_monotonic
-        if elapsed < events_sorted[idx].at_s:
-            continue
+            e = events_sorted[idx]
+            idx += 1
 
-        e = events_sorted[idx]
-        idx += 1
-
-        try:
-            if isinstance(e, EventSetParam):
-                await set_param_best_effort(drone, e.name, e.value)
-                executed.append({"type": "set_param", "at_s": e.at_s, "name": e.name, "value": e.value})
-            elif isinstance(e, EventInjectFailure):
-                unit = _map_failure_unit(e.unit)
-                ftype = _map_failure_type(e.failure)
-                await drone.failure.inject(unit, ftype, int(e.instance))
-                executed.append(
-                    {"type": "inject_failure", "at_s": e.at_s, "unit": e.unit, "failure": e.failure, "instance": e.instance}
-                )
-            else:
-                raise RuntimeError(f"Unknown event: {e}")
-        except Exception as ex:
-            exceptions.append(f"event@{e.at_s}s {e}: {type(ex).__name__}: {ex!s}")
+            try:
+                if isinstance(e, EventSetParam):
+                    await set_param_best_effort(drone, e.name, e.value)
+                    executed.append({"type": "set_param", "at_s": e.at_s, "name": e.name, "value": e.value})
+                elif isinstance(e, EventInjectFailure):
+                    unit = _map_failure_unit(e.unit)
+                    ftype = _map_failure_type(e.failure)
+                    await drone.failure.inject(unit, ftype, int(e.instance))
+                    executed.append(
+                        {"type": "inject_failure", "at_s": e.at_s, "unit": e.unit, "failure": e.failure, "instance": e.instance}
+                    )
+                else:
+                    raise RuntimeError(f"Unknown event: {e}")
+            except Exception as ex:
+                exceptions.append(f"event@{e.at_s}s {e}: {type(ex).__name__}: {ex!s}")
+    except asyncio.CancelledError:
+        return
 
 
 async def run_mission_with_events(
@@ -206,82 +269,90 @@ async def run_mission_with_events(
     landed = False
     timeout = False
 
-    # Disable RC-link-loss action by default (many SITL setups have no RC),
-    # while keeping MAVLink present through MAVSDK.
+    print("[mission] setup params", flush=True)
+
+    # SITL: avoid RC-link-loss action by default
     try:
         await set_param_best_effort(drone, "NAV_RCL_ACT", 0)
     except Exception as ex:
         exceptions.append(f"set NAV_RCL_ACT: {type(ex).__name__}: {ex!s}")
 
-    # Enable failure injection (needed for gps_failure scenario).
+    # Enable failure injection
     try:
         await set_param_best_effort(drone, "SYS_FAILURE_EN", 1)
     except Exception as ex:
         exceptions.append(f"set SYS_FAILURE_EN: {type(ex).__name__}: {ex!s}")
 
-    await wait_for_global_position(drone)
+    # Optional: allow arming without GPS in SITL to reduce flakes
+    try:
+        await set_param_best_effort(drone, "COM_ARM_WO_GPS", 1)
+    except Exception as ex:
+        exceptions.append(f"set COM_ARM_WO_GPS: {type(ex).__name__}: {ex!s}")
 
-    # Home is simply the first reliable global position.
-    async for pos in drone.telemetry.position():
-        home_lat = pos.latitude_deg
-        home_lon = pos.longitude_deg
-        break
+    await wait_for_global_position(drone, timeout_s=min(60.0, timeout_s))
+
+    pos = await _get_first_position(drone, timeout_s=20.0)
+    home_lat, home_lon = pos.latitude_deg, pos.longitude_deg
 
     mission_items = _build_mission_items(home_lat, home_lon, mission)
     mission_plan = MissionPlan(mission_items)
 
-    await drone.mission.set_return_to_launch_after_mission(True)
-    await drone.mission.upload_mission(mission_plan)
+    print("[mission] upload mission", flush=True)
+    await asyncio.wait_for(drone.mission.set_return_to_launch_after_mission(True), timeout=10.0)
+    await asyncio.wait_for(drone.mission.upload_mission(mission_plan), timeout=20.0)
 
-    # Takeoff is handled by Action; the mission items are just waypoints.
-    await drone.action.arm()
-    await drone.action.takeoff()
+    print("[mission] arm", flush=True)
+    await asyncio.wait_for(drone.action.arm(), timeout=20.0)
 
-    # Give it a second to clear the ground.
+    print("[mission] takeoff", flush=True)
+    await asyncio.wait_for(drone.action.takeoff(), timeout=20.0)
+
     await asyncio.sleep(3.0)
 
-    await drone.mission.start_mission()
+    print("[mission] start_mission", flush=True)
+    await asyncio.wait_for(drone.mission.start_mission(), timeout=20.0)
     mission_started = True
 
-    # Background: observe landing and execute scheduled events.
-    t0 = time.monotonic()
+    t0 = _now()
     progress_task = asyncio.create_task(_print_mission_progress(drone))
     events_task = asyncio.create_task(_execute_events(drone, events, t0, executed_events, exceptions))
-    termination_task = asyncio.create_task(_observe_is_in_air(drone, [progress_task, events_task]))
+    termination_task = asyncio.create_task(_observe_end_condition(drone, [progress_task, events_task]))
 
     try:
         await asyncio.wait_for(termination_task, timeout=timeout_s)
         landed = True
     except asyncio.TimeoutError:
         timeout = True
-        # Try to recover gracefully.
+        exceptions.append("mission timeout")
         try:
-            await drone.action.return_to_launch()
+            print("[mission] timeout -> RTL", flush=True)
+            await asyncio.wait_for(drone.action.return_to_launch(), timeout=10.0)
         except Exception as ex:
             exceptions.append(f"RTL after timeout: {type(ex).__name__}: {ex!s}")
 
-    # Determine whether mission finished (best effort).
+    # Best-effort mission finished: bounded wait to avoid hanging forever
     try:
-        async for mp in drone.mission.mission_progress():
-            mission_finished = (mp.current == mp.total)
-            break
+        async def _one_progress():
+            async for mp in drone.mission.mission_progress():
+                return mp
+
+        mp = await asyncio.wait_for(_one_progress(), timeout=2.0)
+        mission_finished = (mp.current == mp.total)
+    except Exception:
+        # If we already detected landing, treat as finished for reporting
+        if landed:
+            mission_finished = True
+
+    # Best-effort disarm
+    try:
+        await asyncio.wait_for(drone.action.disarm(), timeout=10.0)
     except Exception:
         pass
 
-    # Ensure vehicle is disarmed (best effort).
-    try:
-        await drone.action.disarm()
-    except Exception:
-        pass
+    # Ensure background tasks don't hang us
+    await _cancel_tasks_best_effort([progress_task, events_task], timeout_s=2.0)
 
-    # Cancel background tasks.
-    for t in [progress_task, events_task]:
-        if not t.done():
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+    print("[mission] done", flush=True)
 
     return FlightOutcome(
         mission_started=mission_started,
@@ -294,8 +365,11 @@ async def run_mission_with_events(
 
 
 async def _print_mission_progress(drone: System) -> None:
-    async for mission_progress in drone.mission.mission_progress():
-        # Intentionally minimal output (CI-friendly).
-        # Consumers can parse run_metadata.json for details.
-        _ = mission_progress
-        await asyncio.sleep(0)
+    try:
+        async for _ in drone.mission.mission_progress():
+            await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+

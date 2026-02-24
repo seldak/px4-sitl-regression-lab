@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -17,28 +15,63 @@ from .sitl import SITLProcess
 from .util import ensure_dir, newest_file_by_mtime, utc_timestamp
 
 
+def _px4_log_roots(px4_dir: Path) -> list[Path]:
+    """
+    PX4 SITL ULog locations vary by version/setup. Common ones:
+      1) build/px4_sitl_default/rootfs/log/<date>/<log>.ulg
+      2) build/px4_sitl_default/rootfs/fs/microsd/log/<date>/<log>.ulg
+      3) build/px4_sitl_default/rootfs/fs/microsd/log/*.ulg (sometimes flat)
+    """
+    return [
+        px4_dir / "build" / "px4_sitl_default" / "rootfs" / "log",
+        px4_dir / "build" / "px4_sitl_default" / "rootfs" / "fs" / "microsd" / "log",
+        px4_dir / "build" / "px4_sitl_default" / "rootfs" / "fs" / "microsd",
+    ]
+
+
 def _px4_log_root(px4_dir: Path) -> Path:
-    # PX4 SITL logs are typically under:
-    # build/px4_sitl_default/rootfs/fs/microsd/log/<date>/<log>.ulg
-    return px4_dir / "build" / "px4_sitl_default" / "rootfs" / "fs" / "microsd" / "log"
+    """
+    Backwards-compatible helper for older call sites: return the first existing root.
+    """
+    for p in _px4_log_roots(px4_dir):
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "PX4 log root not found. Tried:\n  " + "\n  ".join(map(str, _px4_log_roots(px4_dir)))
+    )
 
 
 def _collect_ulog(px4_dir: Path, run_dir: Path, before: set[Path]) -> Path:
-    log_root = _px4_log_root(px4_dir)
-    if not log_root.exists():
-        raise FileNotFoundError(f"PX4 log root not found: {log_root}")
+    roots = [p for p in _px4_log_roots(px4_dir) if p.exists()]
+    if not roots:
+        raise FileNotFoundError(
+            "PX4 log root not found. Tried:\n  " + "\n  ".join(map(str, _px4_log_roots(px4_dir)))
+        )
 
-    after = set(log_root.rglob("*.ulg"))
+    after: set[Path] = set()
+    for r in roots:
+        after |= set(r.rglob("*.ulg"))
+
     new = list(after - before)
 
     if new:
         new.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         src = new[0]
     else:
-        newest = newest_file_by_mtime(log_root, "*.ulg")
-        if newest is None:
-            raise FileNotFoundError(f"No .ulg logs found under {log_root}")
-        src = newest
+        # Fallback to newest among all roots (in case before/after diff is empty)
+        src = max(after, key=lambda p: p.stat().st_mtime, default=None)
+        if src is None:
+            # As a final fallback, try newest_file_by_mtime per-root
+            newest_any: Optional[Path] = None
+            for r in roots:
+                cand = newest_file_by_mtime(r, "*.ulg")
+                if cand is None:
+                    continue
+                if newest_any is None or cand.stat().st_mtime > newest_any.stat().st_mtime:
+                    newest_any = cand
+            if newest_any is None:
+                raise FileNotFoundError(f"No .ulg logs found under any of: {', '.join(map(str, roots))}")
+            src = newest_any
 
     dst = run_dir / "flight.ulg"
     shutil.copy2(src, dst)
@@ -54,14 +87,18 @@ def run_scenario(
 ) -> Tuple[int, Path]:
     run_name = f"{utc_timestamp()}_{scenario.name}"
     run_dir = ensure_dir(runs_dir / run_name)
+    (run_dir / "run_metadata.json").write_text('{"status":"started"}\n', encoding="utf-8")
+    (run_dir / "report.md").write_text("# Run report\n\nStatus: started\n", encoding="utf-8")
 
     # Ensure PX4 is present.
     px4_dir = repo_root / "external" / "PX4-Autopilot"
     ensure_px4_repo(repo_root=repo_root, px4_dir=px4_dir, tag=scenario.px4.tag, remote=scenario.px4.remote)
 
-    # Capture pre-existing logs to identify the one produced by this scenario.
-    log_root = _px4_log_root(px4_dir)
-    before_logs = set(log_root.rglob("*.ulg")) if log_root.exists() else set()
+    # Capture pre-existing logs (across all likely roots) to identify the one produced by this scenario.
+    before_logs: set[Path] = set()
+    for r in _px4_log_roots(px4_dir):
+        if r.exists():
+            before_logs |= set(r.rglob("*.ulg"))
 
     sitl = SITLProcess(px4_dir=px4_dir, headless=headless, stdout_path=run_dir / "sitl_stdout.log")
 
@@ -140,3 +177,4 @@ def run_scenario(
         exit_code = 2
 
     return exit_code, run_dir
+

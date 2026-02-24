@@ -14,6 +14,11 @@ def ensure_px4_repo(
     """Fetch PX4 into px4_dir if needed, pinned to tag."""
     scripts_dir = repo_root / "scripts"
     fetch_script = scripts_dir / "fetch_px4.sh"
+
+    if os.environ.get("PX4_SKIP_FETCH") == "1":
+        print("[fetch_px4] PX4_SKIP_FETCH=1, skipping repo ensure.", flush=True)
+        return
+
     if not fetch_script.exists():
         raise FileNotFoundError(f"Missing fetch script: {fetch_script}")
 
