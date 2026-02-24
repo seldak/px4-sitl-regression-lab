@@ -12,6 +12,50 @@ import pandas as pd
 from pyulog import ULog
 
 
+def _load_planned_path_xy(ulog_path: Path):
+    md_path = ulog_path.parent / "run_metadata.json"
+    if not md_path.exists():
+        return None
+    try:
+        md = json.loads(md_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pts = md.get("planned_path_xy")
+    if not pts or len(pts) < 2:
+        return None
+    arr = np.array(pts, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        return None
+    return arr
+
+def _point_to_segment_dist(px, py, ax, ay, bx, by):
+    # distance from point P to segment AB (vectorized over points P)
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    denom = abx*abx + aby*aby
+    # handle degenerate segments
+    denom = np.where(denom == 0.0, 1e-12, denom)
+    t = (apx*abx + apy*aby) / denom
+    t = np.clip(t, 0.0, 1.0)
+    cx = ax + t*abx
+    cy = ay + t*aby
+    dx = px - cx
+    dy = py - cy
+    return np.sqrt(dx*dx + dy*dy)
+
+def _polyline_distance(px, py, path_xy: np.ndarray) -> np.ndarray:
+    # For each point (px,py), compute min distance to any segment in the polyline
+    # path_xy shape: (M,2), segments are (i -> i+1)
+    mins = np.full_like(px, np.inf, dtype=np.float64)
+    for i in range(len(path_xy) - 1):
+        ax, ay = path_xy[i]
+        bx, by = path_xy[i + 1]
+        d = _point_to_segment_dist(px, py, ax, ay, bx, by)
+        mins = np.minimum(mins, d)
+    return mins
+
 def _get_dataset(ulog: ULog, name: str):
     for d in ulog.data_list:
         if d.name == name:
@@ -64,6 +108,24 @@ def _quat_to_roll_pitch_deg(q0: np.ndarray, q1: np.ndarray, q2: np.ndarray, q3: 
     return np.degrees(roll), np.degrees(pitch)
 
 
+def _select_setpoint_dataset(ulog: ULog):
+    """
+    Choose a setpoint dataset that actually contains timestamp/x/y.
+    Preference:
+      1) vehicle_local_position_setpoint
+      2) trajectory_setpoint
+    """
+    sp = _get_dataset(ulog, "vehicle_local_position_setpoint")
+    if sp is not None and "timestamp" in sp.data and "x" in sp.data and "y" in sp.data:
+        return sp
+
+    sp = _get_dataset(ulog, "trajectory_setpoint")
+    if sp is not None and "timestamp" in sp.data and "x" in sp.data and "y" in sp.data:
+        return sp
+
+    return None
+
+
 def extract_metrics(ulog_path: Path) -> Dict[str, Any]:
     ulog = ULog(str(ulog_path))
 
@@ -89,26 +151,32 @@ def extract_metrics(ulog_path: Path) -> Dict[str, Any]:
     speed = np.sqrt(vx * vx + vy * vy + vz * vz) if len(vx) else np.array([])
     max_speed = float(np.max(speed)) if len(speed) else float("nan")
 
-    # Setpoint (best-effort)
-    sp = _get_dataset(ulog, "vehicle_local_position_setpoint") or _get_dataset(ulog, "trajectory_setpoint")
+    # Setpoint (best-effort) - FIXED: explicit selection that requires x/y
+    sp = _select_setpoint_dataset(ulog)
+
     horiz_err = np.array([])
     rms_horiz_err = float("nan")
 
-    if sp is not None and "timestamp" in sp.data:
+    if sp is not None:
         tsp = sp.data["timestamp"].astype(np.int64)
-        # Common field names:
-        sx = sp.data.get("x", None)
-        sy = sp.data.get("y", None)
-        sz = sp.data.get("z", None)
-        if sx is not None and sy is not None:
-            sx = sx.astype(np.float64)
-            sy = sy.astype(np.float64)
-            xsp = _interp_nearest(tsp, sx, t_f)
-            ysp = _interp_nearest(tsp, sy, t_f)
-            horiz_err = np.sqrt((x - xsp) ** 2 + (y - ysp) ** 2)
-            rms_horiz_err = float(np.sqrt(np.mean(horiz_err**2))) if len(horiz_err) else float("nan")
+        sx = sp.data["x"].astype(np.float64)
+        sy = sp.data["y"].astype(np.float64)
+        xsp = _interp_nearest(tsp, sx, t_f)
+        ysp = _interp_nearest(tsp, sy, t_f)
+        horiz_err = np.sqrt((x - xsp) ** 2 + (y - ysp) ** 2)
+        rms_horiz_err = float(np.sqrt(np.mean(horiz_err**2))) if len(horiz_err) else float("nan")
 
     max_horiz_err = float(np.max(horiz_err)) if len(horiz_err) else float("nan")
+
+    # after computing max_horiz_err / rms_horiz_err from setpoint (or NaN)
+    if (math.isnan(max_horiz_err) or math.isnan(rms_horiz_err)) and len(x) and len(y):
+        planned = _load_planned_path_xy(ulog_path)
+        if planned is not None:
+            path_err = _polyline_distance(x, y, planned)
+            if len(path_err):
+                max_horiz_err = float(np.max(path_err))
+                rms_horiz_err = float(np.sqrt(np.mean(path_err**2)))
+
 
     # Attitude / tilt (best-effort)
     att = _get_dataset(ulog, "vehicle_attitude")
@@ -164,7 +232,7 @@ def write_plots(ulog_path: Path, out_dir: Path) -> Dict[str, str]:
     t_start, t_end = _flight_time_window_us(ulog)
 
     vpos = _get_dataset(ulog, "vehicle_local_position")
-    sp = _get_dataset(ulog, "vehicle_local_position_setpoint") or _get_dataset(ulog, "trajectory_setpoint")
+    sp = _select_setpoint_dataset(ulog)
 
     if vpos is None:
         return {}
@@ -246,3 +314,4 @@ def write_plots(ulog_path: Path, out_dir: Path) -> Dict[str, str]:
         saved["battery"] = str(p)
 
     return saved
+

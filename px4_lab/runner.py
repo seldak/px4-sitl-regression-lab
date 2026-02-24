@@ -141,7 +141,24 @@ def run_scenario(
         outcome_dict.setdefault("exceptions", []).append(f"collect_ulog: {type(ex).__name__}: {ex!s}")
 
     # Write metadata early.
-    write_json(run_dir / "run_metadata.json", {"scenario": scenario.name, "outcome": outcome_dict})
+    #write_json(run_dir / "run_metadata.json", {"scenario": scenario.name, "outcome": outcome_dict})
+    # planned path in local NED meters (x=north, y=east) from scenario mission waypoints
+    planned_xy = [(0.0, 0.0)]
+    for (north_m, east_m, _alt_m) in scenario.mission.relative_waypoints_m:
+        planned_xy.append((float(north_m), float(east_m)))
+    # close loop if needed
+    if planned_xy[-1] != planned_xy[0]:
+        planned_xy.append(planned_xy[0])
+
+    write_json(
+        run_dir / "run_metadata.json",
+        {
+            "scenario": scenario.name,
+            "outcome": outcome_dict,
+            "planned_path_xy": planned_xy,
+            "planned_waypoints_m": [list(map(float, wp)) for wp in scenario.mission.relative_waypoints_m],
+        },
+    )
 
     # If we have a log, compute metrics and gate.
     exit_code = 2
