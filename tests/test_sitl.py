@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -34,6 +37,28 @@ class SITLLogCaptureTests(unittest.TestCase):
         self.assertEqual(source.tell(), len(source.getvalue()))
         self.assertIn("log truncated after 64 bytes", text)
         self.assertLess(output_size, 160)
+
+    def test_output_is_flushed_before_stream_reaches_eof(self) -> None:
+        read_fd, write_fd = os.pipe()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "sitl_stdout.log"
+            reader = os.fdopen(read_fd, "rb", buffering=0)
+            thread = threading.Thread(
+                target=_capture_stream,
+                args=(reader, output, 1024),
+                daemon=True,
+            )
+            thread.start()
+            os.write(write_fd, b"meaningful PX4 diagnostic\n" * 8)
+
+            deadline = time.monotonic() + 1.0
+            while (not output.exists() or output.stat().st_size == 0) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertGreater(output.stat().st_size, 0)
+            os.close(write_fd)
+            thread.join(timeout=1.0)
+            reader.close()
 
 
 class ArtifactSizeTests(unittest.TestCase):

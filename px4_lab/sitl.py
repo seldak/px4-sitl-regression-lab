@@ -31,7 +31,12 @@ def _capture_stream(stream: BinaryIO, path: Path, max_bytes: int) -> None:
 
     with open(path, "wb") as output:
         while True:
-            chunk = stream.read(64 * 1024)
+            try:
+                chunk = stream.read(64 * 1024)
+            except (OSError, ValueError):
+                # The owner closes the pipe during shutdown if a detached
+                # simulator child keeps the write end open.
+                break
             if not chunk:
                 break
 
@@ -45,6 +50,7 @@ def _capture_stream(stream: BinaryIO, path: Path, max_bytes: int) -> None:
             remaining = max(0, max_bytes - written)
             if remaining:
                 output.write(cleaned[:remaining])
+                output.flush()
                 written += min(len(cleaned), remaining)
             if len(cleaned) > remaining:
                 truncated = True
@@ -61,6 +67,7 @@ def _capture_stream(stream: BinaryIO, path: Path, max_bytes: int) -> None:
             output.write(
                 f"\n[log truncated after {max_bytes} bytes; process output was still drained]\n".encode()
             )
+        output.flush()
 
 
 @dataclass
@@ -163,5 +170,14 @@ class SITLProcess:
             except Exception:
                 pass
         if self._capture_thread is not None:
-            self._capture_thread.join(timeout=5.0)
+            # A simulator child can retain the pipe after the make/PX4 process
+            # exits. Give normal EOF a chance, then close our reader to make
+            # the capture thread flush its final buffered fragment and exit.
+            self._capture_thread.join(timeout=1.0)
+            if self._capture_thread.is_alive() and self.proc is not None and self.proc.stdout is not None:
+                try:
+                    self.proc.stdout.close()
+                except Exception:
+                    pass
+                self._capture_thread.join(timeout=1.0)
             self._capture_thread = None
