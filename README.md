@@ -38,17 +38,19 @@ runs/2026-02-13T12-34-56Z_baseline_square_rtl/
 
 ## Quickstart (native Ubuntu)
 
-### 1) System dependencies
+### 1) Fetch PX4 and install system dependencies
+
 PX4 provides a helper installer, but the two common “gotchas” are:
 - **`ant`** (needed for jMAVSim)
 - JDK/JRE installed (Java runtime)
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip git ant
+sudo apt-get install -y python3 python3-venv python3-pip git ant openjdk-17-jdk
+PX4_FETCH=1 bash scripts/fetch_px4.sh
 ```
 
-If PX4 deps are not installed yet:
+Then install the remaining PX4 build dependencies:
 
 ```bash
 bash external/PX4-Autopilot/Tools/setup/ubuntu.sh
@@ -84,7 +86,11 @@ export PYTHONPATH="$(pwd)"
 python -u scripts/run_all.py --headless
 ```
 
-If `gps_drop.yaml` is flaky on your machine, run it manually and/or move it to nightly CI.
+The GPS-failure scenario is excluded by default because simulator timing can make it less stable. Run it explicitly when needed:
+
+```bash
+python -u scripts/run_scenario.py --scenario scenarios/gps_failure.yaml --headless
+```
 
 ---
 
@@ -96,19 +102,81 @@ Horizontal tracking error is computed as:
 
 This avoids depending on PX4 internal setpoint topics that can vary across versions/backends.
 
+### Trust and pass/fail gates
+
+A run cannot pass from a short or incomplete log fragment. The report checks:
+
+- mission start, completion, landing, timeout, and runtime exceptions
+- a trusted, sustained flight window rather than simulator initialization noise
+- minimum flight duration and sample coverage
+- waypoint completion ratio
+- horizontal error, speed, tilt, and scenario-specific thresholds
+
+If the flight window is not trustworthy, flight plots are suppressed instead of presenting misleading data.
+
 ---
 
-## Docker (not yet verified)
+## Docker
 
-Docker support exists, but it has not been validated end-to-end across setups yet.
-For now, the recommended path is the **native quickstart** above.
+Docker can be used for both headless runs and interactive jMAVSim on Ubuntu. Build the image from the repository root:
 
-If you try Docker and hit issues, please open an issue with:
-- host OS version
-- `docker build` output
-- `runs/*/sitl_stdout.log` and `report.md`
+```bash
+sudo docker build -t px4-reglab -f docker/Dockerfile .
+```
 
-(If/when Docker is validated, this section will be promoted to the recommended path.)
+If your account can access the Docker daemon directly, omit `sudo` from these commands.
+
+### Headless run
+
+Run the default scenario suite without opening the simulator window:
+
+```bash
+sudo docker run --rm -it \
+  --net=host \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -e MPLCONFIGDIR=/tmp/matplotlib \
+  -e PYTHONPATH=/work \
+  -e MAVSDK_CONNECTION_URL="udpin://0.0.0.0:14540" \
+  -e PX4_SKIP_FETCH=1 \
+  -v "$PWD:/work" \
+  -w /work \
+  px4-reglab \
+  python3 -u scripts/run_all.py --headless
+```
+
+The first run clones and builds pinned PX4 dependencies under `external/`; later runs reuse that build. Reports, logs, ULogs, and plots are written to `runs/`. The user mapping prevents the container from leaving root-owned files in either directory.
+
+### Interactive simulator with NVIDIA acceleration
+
+This requires a working host NVIDIA driver and NVIDIA Container Toolkit configured for Docker:
+
+```bash
+sudo docker run --rm -it \
+  --runtime=nvidia \
+  --net=host \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -e MPLCONFIGDIR=/tmp/matplotlib \
+  -e PYTHONPATH=/work \
+  -e DISPLAY="$DISPLAY" \
+  -e MAVSDK_CONNECTION_URL="udpin://0.0.0.0:14540" \
+  -e PX4_SKIP_FETCH=1 \
+  -e LIBGL_ALWAYS_SOFTWARE=0 \
+  -e JMAVSIM_NO_GUI=0 \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=graphics,utility,display \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v "$PWD:/work" \
+  -w /work \
+  px4-reglab \
+  python3 -u scripts/run_scenario.py \
+    --scenario scenarios/baseline.yaml
+```
+
+On hosts where NVIDIA Toolkit reports that Docker is using CDI mode, use `--runtime=nvidia` as shown above. Do not combine it with `--gpus all`. A `render` group does not need to be added for this NVIDIA path.
+
+For a CPU-rendered window, remove the NVIDIA runtime and NVIDIA environment variables, then set `LIBGL_ALWAYS_SOFTWARE=1` instead. It is substantially slower on many systems.
 
 ---
 
