@@ -40,8 +40,8 @@ Event = Union[EventSetParam, EventInjectFailure]
 @dataclass(frozen=True)
 class Thresholds:
     timeout_s: float
-    max_horiz_error_m: float
-    rms_horiz_error_m: float
+    max_horiz_error_m: Optional[float]
+    rms_horiz_error_m: Optional[float]
     max_speed_m_s: float
     max_tilt_deg: float
     min_flight_time_s: float = 10.0
@@ -49,6 +49,8 @@ class Thresholds:
     waypoint_radius_m: float = 8.0
     min_window_samples: int = 100
     require_mission_finished: bool = False
+    max_battery_remaining: Optional[float] = None
+    required_any_nav_state: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,8 +116,16 @@ def load_scenario(path: str) -> Scenario:
     thr_raw = _require(raw, "thresholds")
     thresholds = Thresholds(
         timeout_s=float(_require(thr_raw, "timeout_s")),
-        max_horiz_error_m=float(_require(thr_raw, "max_horiz_error_m")),
-        rms_horiz_error_m=float(_require(thr_raw, "rms_horiz_error_m")),
+        max_horiz_error_m=(
+            None
+            if _require(thr_raw, "max_horiz_error_m") is None
+            else float(thr_raw["max_horiz_error_m"])
+        ),
+        rms_horiz_error_m=(
+            None
+            if _require(thr_raw, "rms_horiz_error_m") is None
+            else float(thr_raw["rms_horiz_error_m"])
+        ),
         max_speed_m_s=float(_require(thr_raw, "max_speed_m_s")),
         max_tilt_deg=float(_require(thr_raw, "max_tilt_deg")),
         min_flight_time_s=float(thr_raw.get("min_flight_time_s", 10.0)),
@@ -125,6 +135,14 @@ def load_scenario(path: str) -> Scenario:
         waypoint_radius_m=float(thr_raw.get("waypoint_radius_m", 8.0)),
         min_window_samples=int(thr_raw.get("min_window_samples", 100)),
         require_mission_finished=bool(thr_raw.get("require_mission_finished", False)),
+        max_battery_remaining=(
+            None
+            if thr_raw.get("max_battery_remaining") is None
+            else float(thr_raw["max_battery_remaining"])
+        ),
+        required_any_nav_state=tuple(
+            int(value) for value in (thr_raw.get("required_any_nav_state", []) or [])
+        ),
     )
     if thresholds.min_flight_time_s < 0:
         raise ValueError("thresholds.min_flight_time_s must be >= 0")
@@ -134,6 +152,12 @@ def load_scenario(path: str) -> Scenario:
         raise ValueError("thresholds.waypoint_radius_m must be > 0")
     if thresholds.min_window_samples < 2:
         raise ValueError("thresholds.min_window_samples must be >= 2")
+    if thresholds.max_battery_remaining is not None and not (
+        0.0 <= thresholds.max_battery_remaining <= 1.0
+    ):
+        raise ValueError("thresholds.max_battery_remaining must be between 0 and 1")
+    if any(value < 0 or value > 255 for value in thresholds.required_any_nav_state):
+        raise ValueError("thresholds.required_any_nav_state values must be between 0 and 255")
 
     return Scenario(
         name=name,

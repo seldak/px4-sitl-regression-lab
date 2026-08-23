@@ -20,14 +20,18 @@ events:
   - at_s: 15
     type: set_param
     name: SIM_BAT_DRAIN
-    value: 2
+    value: 2.0
   - at_s: 20
     type: set_param
     name: SIM_BAT_MIN_PCT
-    value: 5
+    value: 5.0
 thresholds:
   timeout_s: 220
-  max_horiz_error_m: 8.0
-  rms_horiz_error_m: 4.0
+  # Deviation from the square is expected after the failsafe activates.
+  max_horiz_error_m: null
+  rms_horiz_error_m: null
   max_speed_m_s: 20.0
   max_tilt_deg: 65.0
+  max_battery_remaining: 0.10
+  # PX4 v1.16: AUTO_RTL=5, AUTO_LAND=18. Either proves a failsafe response.
+  required_any_nav_state: [5, 18]

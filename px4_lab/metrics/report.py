@@ -13,7 +13,9 @@ def evaluate(
     failures: List[str] = []
     thr = scenario.thresholds
 
-    def chk(name: str, value: float, limit: float) -> None:
+    def chk(name: str, value: float, limit: float | None) -> None:
+        if limit is None:
+            return
         if value != value:  # NaN
             failures.append(f"{name}: missing (NaN)")
             return
@@ -24,6 +26,25 @@ def evaluate(
     chk("rms_horiz_error_m", float(metrics.get("rms_horiz_error_m", float('nan'))), thr.rms_horiz_error_m)
     chk("max_speed_m_s", float(metrics.get("max_speed_m_s", float('nan'))), thr.max_speed_m_s)
     chk("max_tilt_deg", float(metrics.get("max_tilt_deg", float('nan'))), thr.max_tilt_deg)
+
+    if thr.max_battery_remaining is not None:
+        min_battery = float(metrics.get("min_battery_remaining", float("nan")))
+        if min_battery != min_battery:
+            failures.append("min_battery_remaining: missing (NaN)")
+        elif min_battery > thr.max_battery_remaining:
+            failures.append(
+                "min_battery_remaining: "
+                f"{min_battery:.3f} > {thr.max_battery_remaining:.3f} required maximum"
+            )
+
+    if thr.required_any_nav_state:
+        histogram = metrics.get("nav_state_histogram") or {}
+        observed = {int(state) for state, count in histogram.items() if int(count) > 0}
+        if not observed.intersection(thr.required_any_nav_state):
+            failures.append(
+                "nav_state: none of required states observed "
+                f"{list(thr.required_any_nav_state)}; observed {sorted(observed)}"
+            )
 
     window = metrics.get("flight_window") or {}
     if not window.get("trusted", False):
@@ -75,6 +96,9 @@ def evaluate(
             failures.append(
                 f"runtime: only {len(executed_events)}/{len(scenario.events)} configured events executed"
             )
+        failed_events = [event for event in executed_events if not event.get("success", False)]
+        if failed_events:
+            failures.append(f"runtime: {len(failed_events)} event(s) lack success evidence")
 
     return (len(failures) == 0), failures
 
@@ -153,6 +177,8 @@ def render_markdown(
     lines.append(f"- waypoint_radius_m: `{thr.waypoint_radius_m}`")
     lines.append(f"- min_window_samples: `{thr.min_window_samples}`")
     lines.append(f"- require_mission_finished: `{thr.require_mission_finished}`")
+    lines.append(f"- max_battery_remaining: `{thr.max_battery_remaining}`")
+    lines.append(f"- required_any_nav_state: `{list(thr.required_any_nav_state)}`")
     lines.append("")
 
     if failures:

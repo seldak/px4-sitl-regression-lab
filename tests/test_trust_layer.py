@@ -6,14 +6,14 @@ from unittest.mock import patch
 
 import numpy as np
 
-from px4_lab.mavsdk_control import arm_with_retry, connect
+from px4_lab.mavsdk_control import arm_with_retry, connect, set_param_best_effort
 from px4_lab.metrics.extract import (
     _horizontal_error_series,
     select_flight_window,
     write_plots,
 )
 from px4_lab.metrics.report import evaluate
-from px4_lab.scenario import MissionConfig, PX4Config, Scenario, Thresholds
+from px4_lab.scenario import MissionConfig, PX4Config, Scenario, Thresholds, load_scenario
 
 
 class FakeDataset:
@@ -179,6 +179,46 @@ class TrustGateTests(unittest.TestCase):
         )
         self.assertEqual(plots, {})
 
+    def test_low_battery_uses_failsafe_gates_instead_of_path_error(self) -> None:
+        scenario = load_scenario("scenarios/low_battery.yaml")
+        metrics = self.good_metrics()
+        metrics.update(
+            {
+                "max_horiz_error_m": 21.42,
+                "rms_horiz_error_m": 4.91,
+                "min_battery_remaining": 0.05,
+                "nav_state_histogram": {3: 100, 5: 20},
+            }
+        )
+        outcome = self.good_outcome()
+        outcome["executed_events"] = [
+            {"success": True} for _ in scenario.events
+        ]
+
+        passed, failures = evaluate(metrics, scenario, outcome)
+
+        self.assertTrue(passed, failures)
+
+    def test_low_battery_requires_depletion_and_failsafe_mode(self) -> None:
+        scenario = load_scenario("scenarios/low_battery.yaml")
+        metrics = self.good_metrics()
+        metrics.update(
+            {
+                "min_battery_remaining": 0.50,
+                "nav_state_histogram": {3: 100},
+            }
+        )
+        outcome = self.good_outcome()
+        outcome["executed_events"] = [
+            {"success": True} for _ in scenario.events
+        ]
+
+        passed, failures = evaluate(metrics, scenario, outcome)
+
+        self.assertFalse(passed)
+        self.assertTrue(any("min_battery_remaining" in failure for failure in failures))
+        self.assertTrue(any("nav_state" in failure for failure in failures))
+
 
 class ArmRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_transient_arm_denials_are_retried(self) -> None:
@@ -198,6 +238,30 @@ class ArmRetryTests(unittest.IsolatedAsyncioTestCase):
         drone = FakeDrone()
         await arm_with_retry(drone, timeout_s=1.0, retry_interval_s=0.001)
         self.assertEqual(drone.action.attempts, 3)
+
+
+class ParameterEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_type_fallback_records_verified_readback(self) -> None:
+        class FakeParam:
+            async def set_param_int(self, name: str, value: int) -> None:
+                raise RuntimeError("wrong parameter type")
+
+            async def set_param_float(self, name: str, value: float) -> None:
+                self.value = value
+
+            async def get_param_float(self, name: str) -> float:
+                return self.value
+
+        class FakeDrone:
+            def __init__(self) -> None:
+                self.param = FakeParam()
+
+        evidence = await set_param_best_effort(FakeDrone(), "SIM_BAT_DRAIN", 2)
+
+        self.assertTrue(evidence["success"])
+        self.assertEqual(evidence["write_type"], "float")
+        self.assertEqual(evidence["readback"], 2.0)
+        self.assertEqual(len(evidence["attempt_errors"]), 1)
 
 
 class ConnectionTimeoutTests(unittest.IsolatedAsyncioTestCase):

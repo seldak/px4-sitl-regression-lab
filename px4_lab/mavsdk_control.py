@@ -107,28 +107,55 @@ async def _get_first_position(drone: System, timeout_s: float = 20.0):
     return await asyncio.wait_for(_wait(), timeout=timeout_s)
 
 
-async def set_param_best_effort(drone: System, name: str, value: Union[int, float, str, bool]) -> None:
+async def set_param_best_effort(
+    drone: System, name: str, value: Union[int, float, str, bool]
+) -> Dict[str, Any]:
+    attempts: List[str] = []
+
+    async def _write_and_verify(value_type: str, candidate: Union[int, float, str]) -> Dict[str, Any]:
+        if value_type == "int":
+            await drone.param.set_param_int(name, int(candidate))
+            readback: Union[int, float, str] = await drone.param.get_param_int(name)
+            matches = int(readback) == int(candidate)
+        elif value_type == "float":
+            await drone.param.set_param_float(name, float(candidate))
+            readback = await drone.param.get_param_float(name)
+            tolerance = max(1e-6, abs(float(candidate)) * 1e-6)
+            matches = abs(float(readback) - float(candidate)) <= tolerance
+        else:
+            await drone.param.set_param_custom(name, str(candidate))
+            readback = await drone.param.get_param_custom(name)
+            matches = str(readback) == str(candidate)
+
+        if not matches:
+            raise RuntimeError(
+                f"readback mismatch for {name}: requested {candidate!r}, got {readback!r}"
+            )
+        return {
+            "success": True,
+            "write_type": value_type,
+            "readback": readback,
+            "attempt_errors": list(attempts),
+        }
+
     if isinstance(value, bool):
-        await drone.param.set_param_int(name, int(value))
-        return
+        candidates = [("int", int(value))]
+    elif isinstance(value, int):
+        candidates = [("int", value), ("float", float(value))]
+    elif isinstance(value, float):
+        candidates = [("float", value), ("int", int(value))]
+    else:
+        candidates = [("custom", str(value))]
 
-    if isinstance(value, int):
+    last_exception: Optional[Exception] = None
+    for value_type, candidate in candidates:
         try:
-            await drone.param.set_param_int(name, value)
-            return
-        except Exception:
-            await drone.param.set_param_float(name, float(value))
-            return
+            return await _write_and_verify(value_type, candidate)
+        except Exception as ex:
+            last_exception = ex
+            attempts.append(f"{value_type}: {type(ex).__name__}: {ex!s}")
 
-    if isinstance(value, float):
-        try:
-            await drone.param.set_param_float(name, float(value))
-            return
-        except Exception:
-            await drone.param.set_param_int(name, int(value))
-            return
-
-    await drone.param.set_param_custom(name, str(value))
+    raise RuntimeError(f"failed to set and verify {name}: {'; '.join(attempts)}") from last_exception
 
 
 def _map_failure_unit(unit: str) -> FailureUnit:
@@ -284,14 +311,29 @@ async def _execute_events(
 
             try:
                 if isinstance(e, EventSetParam):
-                    await set_param_best_effort(drone, e.name, e.value)
-                    executed.append({"type": "set_param", "at_s": e.at_s, "name": e.name, "value": e.value})
+                    evidence = await set_param_best_effort(drone, e.name, e.value)
+                    executed.append(
+                        {
+                            "type": "set_param",
+                            "at_s": e.at_s,
+                            "name": e.name,
+                            "value": e.value,
+                            **evidence,
+                        }
+                    )
                 elif isinstance(e, EventInjectFailure):
                     unit = _map_failure_unit(e.unit)
                     ftype = _map_failure_type(e.failure)
                     await drone.failure.inject(unit, ftype, int(e.instance))
                     executed.append(
-                        {"type": "inject_failure", "at_s": e.at_s, "unit": e.unit, "failure": e.failure, "instance": e.instance}
+                        {
+                            "type": "inject_failure",
+                            "at_s": e.at_s,
+                            "unit": e.unit,
+                            "failure": e.failure,
+                            "instance": e.instance,
+                            "success": True,
+                        }
                     )
                 else:
                     raise RuntimeError(f"Unknown event: {e}")
