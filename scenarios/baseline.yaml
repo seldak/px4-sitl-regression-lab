@@ -17,3 +17,8 @@ thresholds:
   rms_horiz_error_m: 3.0
   max_speed_m_s: 18.0
   max_tilt_deg: 60.0
+  min_flight_time_s: 30.0
+  min_waypoint_completion_ratio: 0.75
+  waypoint_radius_m: 8.0
+  min_window_samples: 500
+  require_mission_finished: true

@@ -165,8 +165,13 @@ def run_scenario(
     if ulog_path and ulog_path.exists():
         try:
             metrics = extract_metrics(ulog_path)
-            plots = write_plots(ulog_path, run_dir / "plots")
-            passed, failures = evaluate(metrics, scenario)
+            plots = write_plots(
+                ulog_path,
+                run_dir / "plots",
+                flight_window=metrics["flight_window"],
+                horiz_error_source=metrics["horiz_error_source"],
+            )
+            passed, failures = evaluate(metrics, scenario, outcome=outcome_dict)
 
             write_json(run_dir / "metrics.json", metrics)
             report_md = render_markdown(
@@ -194,4 +199,3 @@ def run_scenario(
         exit_code = 2
 
     return exit_code, run_dir
-

@@ -42,16 +42,54 @@ async def connect(system_address: str = "udpin://0.0.0.0:14540", timeout_s: floa
     return await asyncio.wait_for(_wait_connected(), timeout=timeout_s)
 
 
-async def wait_for_global_position(drone: System, timeout_s: float = 60.0) -> None:
-    print("[mavsdk] wait_for_global_position...", flush=True)
+async def wait_for_global_position(
+    drone: System, timeout_s: float = 60.0, stable_s: float = 3.0
+) -> None:
+    print(f"[mavsdk] wait_for_global_position (stable for {stable_s:.1f}s)...", flush=True)
 
     async def _wait() -> None:
+        healthy_since: Optional[float] = None
         async for health in drone.telemetry.health():
             if health.is_global_position_ok and health.is_home_position_ok:
-                print("[mavsdk] global+home position OK", flush=True)
-                return
+                if healthy_since is None:
+                    healthy_since = _now()
+                if _now() - healthy_since >= stable_s:
+                    print("[mavsdk] global+home position stable", flush=True)
+                    return
+            else:
+                healthy_since = None
 
     await asyncio.wait_for(_wait(), timeout=timeout_s)
+
+
+async def arm_with_retry(
+    drone: System, timeout_s: float = 35.0, retry_interval_s: float = 2.0
+) -> None:
+    """Retry transient SITL preflight denials while health checks settle."""
+    deadline = _now() + timeout_s
+    attempt = 0
+    last_exception: Optional[Exception] = None
+
+    while _now() < deadline:
+        attempt += 1
+        try:
+            await asyncio.wait_for(drone.action.arm(), timeout=min(8.0, timeout_s))
+            print(f"[mission] armed (attempt {attempt})", flush=True)
+            return
+        except Exception as ex:
+            last_exception = ex
+            remaining_s = max(0.0, deadline - _now())
+            print(
+                f"[mission] arm attempt {attempt} denied; waiting for preflight health "
+                f"({remaining_s:.1f}s remaining)",
+                flush=True,
+            )
+            if remaining_s > 0:
+                await asyncio.sleep(min(retry_interval_s, remaining_s))
+
+    if last_exception is not None:
+        raise last_exception
+    raise TimeoutError(f"Arming did not complete within {timeout_s:.1f}s")
 
 
 async def _get_first_position(drone: System, timeout_s: float = 20.0):
@@ -302,7 +340,7 @@ async def run_mission_with_events(
     await asyncio.wait_for(drone.mission.upload_mission(mission_plan), timeout=20.0)
 
     print("[mission] arm", flush=True)
-    await asyncio.wait_for(drone.action.arm(), timeout=20.0)
+    await arm_with_retry(drone, timeout_s=min(35.0, max(15.0, timeout_s / 4.0)))
 
     print("[mission] takeoff", flush=True)
     await asyncio.wait_for(drone.action.takeoff(), timeout=20.0)
@@ -372,4 +410,3 @@ async def _print_mission_progress(drone: System) -> None:
         return
     except Exception:
         return
-

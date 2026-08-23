@@ -44,6 +44,11 @@ class Thresholds:
     rms_horiz_error_m: float
     max_speed_m_s: float
     max_tilt_deg: float
+    min_flight_time_s: float = 10.0
+    min_waypoint_completion_ratio: float = 0.0
+    waypoint_radius_m: float = 8.0
+    min_window_samples: int = 100
+    require_mission_finished: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,7 +118,22 @@ def load_scenario(path: str) -> Scenario:
         rms_horiz_error_m=float(_require(thr_raw, "rms_horiz_error_m")),
         max_speed_m_s=float(_require(thr_raw, "max_speed_m_s")),
         max_tilt_deg=float(_require(thr_raw, "max_tilt_deg")),
+        min_flight_time_s=float(thr_raw.get("min_flight_time_s", 10.0)),
+        min_waypoint_completion_ratio=float(
+            thr_raw.get("min_waypoint_completion_ratio", 0.0)
+        ),
+        waypoint_radius_m=float(thr_raw.get("waypoint_radius_m", 8.0)),
+        min_window_samples=int(thr_raw.get("min_window_samples", 100)),
+        require_mission_finished=bool(thr_raw.get("require_mission_finished", False)),
     )
+    if thresholds.min_flight_time_s < 0:
+        raise ValueError("thresholds.min_flight_time_s must be >= 0")
+    if not 0.0 <= thresholds.min_waypoint_completion_ratio <= 1.0:
+        raise ValueError("thresholds.min_waypoint_completion_ratio must be between 0 and 1")
+    if thresholds.waypoint_radius_m <= 0:
+        raise ValueError("thresholds.waypoint_radius_m must be > 0")
+    if thresholds.min_window_samples < 2:
+        raise ValueError("thresholds.min_window_samples must be >= 2")
 
     return Scenario(
         name=name,
