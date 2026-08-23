@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
-from px4_lab.mavsdk_control import arm_with_retry
+from px4_lab.mavsdk_control import arm_with_retry, connect
 from px4_lab.metrics.extract import (
     _horizontal_error_series,
     select_flight_window,
@@ -197,6 +198,19 @@ class ArmRetryTests(unittest.IsolatedAsyncioTestCase):
         drone = FakeDrone()
         await arm_with_retry(drone, timeout_s=1.0, retry_interval_s=0.001)
         self.assertEqual(drone.action.attempts, 3)
+
+
+class ConnectionTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_server_startup_is_covered_by_connection_deadline(self) -> None:
+        class HangingSystem:
+            async def connect(self, system_address: str) -> None:
+                import asyncio
+
+                await asyncio.Event().wait()
+
+        with patch("px4_lab.mavsdk_control.System", HangingSystem):
+            with self.assertRaisesRegex(TimeoutError, "within 0.0s"):
+                await connect(timeout_s=0.01)
 
 
 if __name__ == "__main__":

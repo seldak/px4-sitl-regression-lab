@@ -29,17 +29,24 @@ def _now() -> float:
 
 async def connect(system_address: str = "udpin://0.0.0.0:14540", timeout_s: float = 30.0) -> System:
     print(f"[mavsdk] connect({system_address})", flush=True)
-    drone = System()
-    await drone.connect(system_address=system_address)
-
-    async def _wait_connected() -> System:
+    async def _connect_and_wait() -> System:
+        drone = System()
+        # Starting mavsdk_server is part of the connection deadline. Previously
+        # this await sat outside wait_for(), so a server startup problem could
+        # leave CI blocked indefinitely before it began watching heartbeats.
+        await drone.connect(system_address=system_address)
         async for state in drone.core.connection_state():
             if state.is_connected:
                 print("[mavsdk] connected", flush=True)
                 return drone
         raise TimeoutError("Connection state stream ended unexpectedly")
 
-    return await asyncio.wait_for(_wait_connected(), timeout=timeout_s)
+    try:
+        return await asyncio.wait_for(_connect_and_wait(), timeout=timeout_s)
+    except asyncio.TimeoutError as ex:
+        raise TimeoutError(
+            f"MAVSDK did not connect to PX4 at {system_address} within {timeout_s:.1f}s"
+        ) from ex
 
 
 async def wait_for_global_position(

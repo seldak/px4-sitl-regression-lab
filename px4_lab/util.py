@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 def utc_timestamp() -> str:
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    # Colons are rejected in file paths by actions/upload-artifact.
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
 def ensure_dir(p: Path) -> Path:

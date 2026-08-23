@@ -48,6 +48,10 @@ jobs:
           PX4_FETCH=1 bash scripts/fetch_px4.sh
           pip install -r external/PX4-Autopilot/Tools/setup/requirements.txt
 
+      - name: Build PX4 SITL
+        run: |
+          make -C external/PX4-Autopilot px4_sitl_default
+
       - name: Run scenarios (headless)
         env:
           PX4_SKIP_FETCH: "1"
