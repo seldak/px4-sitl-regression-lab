@@ -60,6 +60,31 @@ class SITLLogCaptureTests(unittest.TestCase):
             thread.join(timeout=1.0)
             reader.close()
 
+    def test_stop_event_ends_capture_while_writer_remains_open(self) -> None:
+        read_fd, write_fd = os.pipe()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "sitl_stdout.log"
+            reader = os.fdopen(read_fd, "rb", buffering=0)
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=_capture_stream,
+                args=(reader, output, 1024, stop_event),
+                daemon=True,
+            )
+            thread.start()
+            os.write(write_fd, b"PX4 diagnostic before shutdown\n")
+
+            deadline = time.monotonic() + 1.0
+            while (not output.exists() or output.stat().st_size == 0) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            stop_event.set()
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertIn("PX4 diagnostic", output.read_text(encoding="utf-8"))
+            os.close(write_fd)
+            reader.close()
+
 
 class ArtifactSizeTests(unittest.TestCase):
     def test_oversized_files_are_reported(self) -> None:

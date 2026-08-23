@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import select
 import signal
 import subprocess
 import threading
@@ -22,7 +23,12 @@ def _clean_console_text(text: str) -> str:
     return _PXH_REDRAW_RE.sub("", text)
 
 
-def _capture_stream(stream: BinaryIO, path: Path, max_bytes: int) -> None:
+def _capture_stream(
+    stream: BinaryIO,
+    path: Path,
+    max_bytes: int,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
     """Drain process output while writing a bounded, plain-text diagnostic log."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     carry = ""
@@ -30,12 +36,16 @@ def _capture_stream(stream: BinaryIO, path: Path, max_bytes: int) -> None:
     truncated = False
 
     with open(path, "wb") as output:
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
-                chunk = stream.read(64 * 1024)
+                if stop_event is None:
+                    chunk = stream.read(64 * 1024)
+                else:
+                    readable, _, _ = select.select([stream.fileno()], [], [], 0.2)
+                    if not readable:
+                        continue
+                    chunk = os.read(stream.fileno(), 64 * 1024)
             except (OSError, ValueError):
-                # The owner closes the pipe during shutdown if a detached
-                # simulator child keeps the write end open.
                 break
             if not chunk:
                 break
@@ -79,6 +89,7 @@ class SITLProcess:
 
     proc: Optional[subprocess.Popen] = None
     _capture_thread: Optional[threading.Thread] = None
+    _capture_stop: Optional[threading.Event] = None
 
     def start(self) -> None:
         self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,9 +117,10 @@ class SITLProcess:
         )
         if self.proc.stdout is None:
             raise RuntimeError("Failed to capture PX4 SITL output")
+        self._capture_stop = threading.Event()
         self._capture_thread = threading.Thread(
             target=_capture_stream,
-            args=(self.proc.stdout, self.stdout_path, self.max_log_bytes),
+            args=(self.proc.stdout, self.stdout_path, self.max_log_bytes, self._capture_stop),
             name="px4-sitl-log-capture",
             daemon=True,
         )
@@ -170,14 +182,19 @@ class SITLProcess:
             except Exception:
                 pass
         if self._capture_thread is not None:
-            # A simulator child can retain the pipe after the make/PX4 process
-            # exits. Give normal EOF a chance, then close our reader to make
-            # the capture thread flush its final buffered fragment and exit.
-            self._capture_thread.join(timeout=1.0)
-            if self._capture_thread.is_alive() and self.proc is not None and self.proc.stdout is not None:
-                try:
-                    self.proc.stdout.close()
-                except Exception:
-                    pass
-                self._capture_thread.join(timeout=1.0)
+            # A detached simulator child can retain the write end indefinitely.
+            # Signal the select-based reader instead of closing its pipe from
+            # this thread, which can deadlock on Python's buffered-reader lock.
+            if self._capture_stop is not None:
+                self._capture_stop.set()
+            self._capture_thread.join(timeout=2.0)
+            capture_stopped = not self._capture_thread.is_alive()
             self._capture_thread = None
+            self._capture_stop = None
+        else:
+            capture_stopped = True
+        if capture_stopped and self.proc is not None and self.proc.stdout is not None:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass

@@ -53,6 +53,7 @@ jobs:
           make -C external/PX4-Autopilot px4_sitl_default
 
       - name: Run scenarios (headless)
+        timeout-minutes: 15
         env:
           PX4_SKIP_FETCH: "1"
         run: |
