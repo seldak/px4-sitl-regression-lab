@@ -16,6 +16,25 @@ fi
 
 cd "$PX4_DIR"
 
+# PX4's version-header generator expects release tags in the nested NuttX
+# submodule. `git clone --shallow-submodules` omits those tags, which makes a
+# clean CI build fail with an IndexError before compilation begins.
+ensure_nuttx_tags() {
+  local nuttx_dir="platforms/nuttx/NuttX/nuttx"
+
+  [[ -e "$nuttx_dir/.git" ]] || return 0
+  [[ -n "$(git -C "$nuttx_dir" tag --list 'nuttx-[0-9]*')" ]] && return 0
+
+  if [[ "$PX4_FETCH" != "1" ]]; then
+    echo "[fetch_px4] NuttX release tags are missing from the shallow submodule."
+    echo "          Re-run with PX4_FETCH=1 to fetch version metadata."
+    exit 2
+  fi
+
+  echo "[fetch_px4] Fetching NuttX release tags required by the PX4 build ..."
+  git -C "$nuttx_dir" fetch --force --tags --depth 1 origin
+}
+
 # Helper: check whether HEAD matches desired tag (when tag exists locally)
 head_matches_tag() {
   git rev-parse -q --verify "refs/tags/$PX4_TAG" >/dev/null 2>&1 || return 1
@@ -27,17 +46,19 @@ head_matches_tag() {
 
 # 1) Fast path: already at requested tag
 if head_matches_tag; then
-  echo "[fetch_px4] Already at $PX4_TAG (offline)."
+  echo "[fetch_px4] Already at $PX4_TAG."
   # Ensure submodules are present (no network required if already cloned shallow-submodules)
   git submodule update --init --recursive
+  ensure_nuttx_tags
   exit 0
 fi
 
 # 2) If tag exists locally, checkout without network
 if git rev-parse -q --verify "refs/tags/$PX4_TAG" >/dev/null 2>&1; then
-  echo "[fetch_px4] Tag exists locally, checking out $PX4_TAG (offline)."
+  echo "[fetch_px4] Tag exists locally, checking out $PX4_TAG."
   git checkout -q "$PX4_TAG"
   git submodule update --init --recursive
+  ensure_nuttx_tags
   exit 0
 fi
 
@@ -53,6 +74,6 @@ echo "[fetch_px4] Fetching tag $PX4_TAG from remote ..."
 git fetch --tags --force --depth 1 "$PX4_REMOTE" "refs/tags/${PX4_TAG}:refs/tags/${PX4_TAG}"
 git checkout -q "$PX4_TAG"
 git submodule update --init --recursive --depth 1
+ensure_nuttx_tags
 
 echo "[fetch_px4] Done."
-
